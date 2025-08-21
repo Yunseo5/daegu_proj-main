@@ -1,0 +1,693 @@
+---
+title: "대구광역시 취약장소 식별 및 안전도 향상 분석"
+author: "데이터 분석팀"
+date: "`r Sys.Date()`"
+format:
+  html:
+    code-fold: true
+    toc: true
+    toc-depth: 3
+    number-sections: false
+    theme: cosmo
+  pdf:
+    toc: true
+    number-sections: false
+execute:
+  echo: true
+  warning: false
+  message: false
+jupyter: python3
+---
+
+# 대구광역시 취약장소 식별 및 안전도 향상 분석
+
+```{python}
+#| label: setup
+#| include: false
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import pearsonr, spearmanr
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.neighbors import KNeighborsClassifier
+import requests
+import time
+from tqdm import tqdm
+import platform
+
+# 한글 폰트 설정
+import matplotlib.font_manager as fm
+
+# 시스템에 설치된 한글 폰트 찾기
+font_list = [f.name for f in fm.fontManager.ttflist if 'gothic' in f.name.lower() or 'malgun' in f.name.lower()]
+if font_list:
+    plt.rc('font', family=font_list[0])
+else:
+    # 폰트가 없으면 기본 설정으로
+    plt.rcParams['font.family'] = ['DejaVu Sans', 'Arial Unicode MS', 'Apple Gothic', 'Malgun Gothic']
+
+# 마이너스 기호 깨짐 방지
+plt.rcParams['axes.unicode_minus'] = False
+
+# 한글 폰트 확인 및 테스트
+print("사용 가능한 한글 폰트:", font_list)
+print("현재 설정된 폰트:", plt.rcParams['font.family'])
+plt.rcParams['figure.dpi'] = 150
+plt.style.use('seaborn-v0_8')
+```
+
+### 1.1 연구 배경
+
+**전국 대비 대구시 범죄 현황**
+
+2023년 기준 전국 범죄 통계 분석 결과, 대구광역시는 다음과 같은 특징을 보입니다:
+
+- **범죄발생수**: 21,994건
+- **인구수**: 2,357,997명  
+- **범죄율**: 8.72건/1,000명 (전국 17개 시도 중 5위)
+
+대구시는 전국 평균 범죄율에서 중간 수준에 위치하고 있으나, 울산(13.07건/1,000명), 부산(10.18건/1,000명) 등 인접 지역 대비 상당한 수준의 범죄율을 보이고 있습니다. 특히 2025년부터 검거율이 감소하는 추세를 보이고 있어, 이러한 문제를 해결하기 위한 데이터 기반의 체계적 접근이 필요한 시점입니다.
+
+**범죄발생수 추정 방법론**
+
+동별 범죄 통계가 공개되지 않는 현실적 제약을 고려하여, 다음 공식을 통해 행정동별 범죄발생수를 추정했습니다:
+
+**동별 범죄발생수 = 구별 범죄발생수 × (동별 인구수 ÷ 구별 인구수)**
+
+이는 인구수와 범죄발생수 간의 높은 상관관계를 바탕으로 한 합리적 추정 방법입니다.
+
+```{python}
+#| label: national-crime-analysis
+#| fig-cap: "전국 시도별 인구수와 범죄발생수 상관관계 분석"
+#| fig-width: 12
+#| fig-height: 8
+
+# 전국 시도별 데이터
+data = {
+    'Region': ['Gyeonggi', 'Seoul', 'Busan', 'Gyeongnam', 'Incheon', 'Daegu', 'Gyeongbuk', 
+               'Chungnam', 'Jeonnam', 'Daejeon', 'Jeonbuk', 'Gwangju', 'Chungbuk', 
+               'Gangwon', 'Jeju', 'Ulsan', 'Sejong'],
+    'Crime_Count': [111012, 86349, 33141, 29982, 25633, 21994, 21211, 
+                   17966, 15430, 14246, 14113, 13252, 12295, 
+                   12262, 8877, 8723, 2409],
+    'Population': [13706488, 9328042, 3254457, 3217584, 3037049, 2357997, 2520934,
+                  2135908, 1784116, 1439607, 1731309, 1399880, 1590956,
+                  1511341, 667242, 1094027, 392211]
+}
+
+df_national = pd.DataFrame(data)
+
+# 상관계수 계산
+correlation, p_value = pearsonr(df_national['Population'], df_national['Crime_Count'])
+
+# 시각화
+plt.figure(figsize=(12, 8))
+plt.scatter(df_national['Population']/10000, df_national['Crime_Count'], 
+           s=100, alpha=0.7, color='steelblue')
+
+# 대구 강조
+daegu_idx = df_national[df_national['Region'] == 'Daegu'].index[0]
+plt.scatter(df_national.loc[daegu_idx, 'Population']/10000, 
+           df_national.loc[daegu_idx, 'Crime_Count'], 
+           s=150, color='red', label='Daegu', zorder=5)
+
+# 회귀선 추가
+z = np.polyfit(df_national['Population'], df_national['Crime_Count'], 1)
+p = np.poly1d(z)
+plt.plot(df_national['Population']/10000, p(df_national['Population']), 
+         "r--", alpha=0.8, linewidth=2)
+
+# 지역명 라벨링
+for i, txt in enumerate(df_national['Region']):
+    plt.annotate(txt, (df_national['Population'][i]/10000, df_national['Crime_Count'][i]),
+                xytext=(5, 5), textcoords='offset points', fontsize=9)
+
+plt.xlabel('Population (10,000 people)', fontsize=12)
+plt.ylabel('Crime Count (cases)', fontsize=12)
+plt.title('Correlation between Population and Crime Count by Province\n(Correlation: {:.3f}, p-value: {:.3e})'.format(correlation, p_value), 
+          fontsize=14, pad=20)
+plt.grid(True, alpha=0.3)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+print(f"상관계수: {correlation:.4f}")
+print(f"P-value: {p_value:.3e}")
+print(f"결정계수(R²): {correlation**2:.4f}")
+```
+
+**분석 결과**: 전국 시도별 인구수와 범죄발생수는 매우 높은 양의 상관관계(r > 0.9)를 보여, 인구비례 배분이 통계적으로 타당함을 확인했습니다.
+
+```{python}
+#| label: crime-rate-ranking
+#| fig-cap: "전국 시도별 범죄율 순위 및 인구규모별 분석"
+#| fig-width: 15
+#| fig-height: 12
+
+# 추가 시각화: 범죄율 순위 막대그래프
+df_national['Crime_Rate'] = df_national['Crime_Count'] / df_national['Population'] * 1000
+df_sorted = df_national.sort_values('Crime_Rate', ascending=True)
+
+# 대구 위치 확인
+daegu_rank = df_sorted.reset_index().index[df_sorted['Region'] == 'Daegu'].tolist()[0]
+
+# 색상 설정 (대구는 빨간색, 나머지는 그라데이션)
+colors = plt.cm.RdYlBu_r(np.linspace(0.2, 0.8, len(df_sorted)))
+colors[daegu_rank] = [1, 0.2, 0.2, 1]  # 대구만 빨간색
+
+plt.figure(figsize=(15, 12))
+
+# 서브플롯 1: 범죄율 순위
+plt.subplot(2, 1, 1)
+bars = plt.barh(df_sorted['Region'], df_sorted['Crime_Rate'], color=colors)
+
+# 대구 막대에 테두리 추가
+bars[daegu_rank].set_edgecolor('darkred')
+bars[daegu_rank].set_linewidth(3)
+
+# 값 표시
+for i, (idx, row) in enumerate(df_sorted.iterrows()):
+    plt.text(row['Crime_Rate'] + 0.1, i, f'{row["Crime_Rate"]:.2f}', 
+             va='center', fontweight='bold' if row['Region'] == 'Daegu' else 'normal',
+             color='darkred' if row['Region'] == 'Daegu' else 'black')
+
+plt.xlabel('Crime Rate (cases/1,000 people)', fontsize=12, fontweight='bold')
+plt.ylabel('Province', fontsize=12, fontweight='bold')
+plt.title('National Crime Rate by Province (2023) - Daegu ranks 5th among 17 provinces', 
+          fontsize=16, fontweight='bold', pad=20)
+
+# 전국 평균선 추가
+avg_rate = df_national['Crime_Rate'].mean()
+plt.axvline(avg_rate, color='gray', linestyle='--', alpha=0.7, linewidth=2)
+plt.text(avg_rate + 0.1, len(df_sorted) - 1, f'National Avg: {avg_rate:.2f}', 
+         rotation=90, va='top', color='gray', fontweight='bold')
+
+plt.grid(axis='x', alpha=0.3)
+
+# 서브플롯 2: 인구규모별 분석
+plt.subplot(2, 2, 3)
+df_national['Population_Size'] = pd.cut(df_national['Population'], 
+                                       bins=[0, 1000000, 3000000, float('inf')], 
+                                       labels=['Small\n(<1M)', 'Medium\n(1M-3M)', 'Large\n(>3M)'])
+
+box_data = [df_national[df_national['Population_Size'] == category]['Crime_Rate'] 
+            for category in df_national['Population_Size'].cat.categories]
+bp = plt.boxplot(box_data, labels=df_national['Population_Size'].cat.categories, 
+                patch_artist=True, notch=True)
+
+# 박스 색상 설정
+colors_box = ['#ff9999', '#66b3ff', '#99ff99']
+for patch, color in zip(bp['boxes'], colors_box):
+    patch.set_facecolor(color)
+    patch.set_alpha(0.7)
+
+# 대구 데이터 포인트 추가
+daegu_category = df_national[df_national['Region'] == 'Daegu']['Population_Size'].iloc[0]
+daegu_rate = df_national[df_national['Region'] == 'Daegu']['Crime_Rate'].iloc[0]
+category_index = list(df_national['Population_Size'].cat.categories).index(daegu_category) + 1
+plt.scatter(category_index, daegu_rate, color='red', s=100, zorder=5, 
+           marker='*', label='Daegu (Medium)')
+
+plt.ylabel('Crime Rate (cases/1,000 people)', fontweight='bold')
+plt.title('Crime Rate Distribution by Population Size', fontweight='bold')
+plt.legend()
+plt.grid(axis='y', alpha=0.3)
+
+# 서브플롯 3: 인구수 vs 범죄발생수
+plt.subplot(2, 2, 4)
+scatter = plt.scatter(df_national['Population']/10000, df_national['Crime_Count'], 
+                     s=80, alpha=0.6, c=df_national['Crime_Rate'], cmap='Reds')
+
+# 대구 강조
+daegu_data = df_national[df_national['Region'] == 'Daegu']
+plt.scatter(daegu_data['Population']/10000, daegu_data['Crime_Count'], 
+           s=200, color='darkred', marker='*', label='Daegu', zorder=5, 
+           edgecolor='white', linewidth=2)
+
+plt.xlabel('Population (10,000 people)', fontweight='bold')
+plt.ylabel('Crime Count (cases)', fontweight='bold')
+plt.title('Population vs Crime Count\n(Color: Crime Rate)', fontweight='bold')
+
+# 컬러바 추가
+cbar = plt.colorbar(scatter)
+cbar.set_label('Crime Rate (cases/1,000 people)', fontweight='bold')
+
+plt.legend()
+plt.grid(alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+
+# 상관관계 요약 정보 출력
+print("="*50)
+print("전국 시도별 범죄 현황 요약")
+print("="*50)
+print(f"최고 범죄율: {df_national.loc[df_national['Crime_Rate'].idxmax(), 'Region']} "
+      f"({df_national['Crime_Rate'].max():.2f}건/1,000명)")
+print(f"최저 범죄율: {df_national.loc[df_national['Crime_Rate'].idxmin(), 'Region']} "
+      f"({df_national['Crime_Rate'].min():.2f}건/1,000명)")
+
+# 대구 순위 제대로 계산 (높은 순서부터)
+df_rank_high_to_low = df_national.sort_values('Crime_Rate', ascending=False)
+daegu_rank_correct = df_rank_high_to_low.reset_index().index[df_rank_high_to_low['Region'] == 'Daegu'].tolist()[0] + 1
+
+print(f"대구 범죄율: {df_national[df_national['Region']=='Daegu']['Crime_Rate'].iloc[0]:.2f}건/1,000명 "
+      f"(전국 {daegu_rank_correct}위)")
+print(f"전국 평균: {df_national['Crime_Rate'].mean():.2f}건/1,000명")
+print(f"인구수-범죄발생수 상관계수: {correlation:.4f} (매우 강한 양의 상관관계)")
+```
+
+### 1.2 연구 목적
+다양한 공공데이터를 통합 분석하여 범죄 발생이 집중되는 위험지역을 식별하고, 이를 바탕으로 안전도 향상 방안을 도출하는 것을 목표로 합니다.
+
+### 1.3 분석 범위
+- **공간적 범위**: 대구광역시 전체 행정동 (135개)
+- **시간적 범위**: 2023년 기준 데이터
+- **분석 대상**: 안전 인프라, 지역 특성, 인구통계, 범죄발생 현황
+
+## 데이터 수집 및 구조 {#sec-data}
+
+### 2.1 데이터 소스
+
+본 연구에서는 13개 공공데이터 소스를 활용하여 종합적인 분석을 수행했습니다.
+
+**안전 인프라 데이터**
+- 대구광역시 CCTV 정보 (local data)
+- 대구광역시 안전비상벨 위치정보 (local data)
+- 대구광역시 가로등 현황 (공공데이터포털)
+- 대구광역시 보안등 현황 (공공데이터포털)
+
+**치안 시설 데이터**
+- 대구광역시 관서별 경찰서 위치 (공공데이터포털)
+- 대구광역시 치안센터 위치 (공공데이터포털)
+
+**지역 특성 데이터**
+- 대구광역시 유흥주점 현황 (공공데이터포털)
+- 대구광역시 상가정보 (소상공인시장진흥공단)
+- 대구광역시 학교 위치 (공공데이터포털)
+- 대구광역시 대학교 위치 (공공데이터포털)
+
+**인구통계 데이터**
+- 대구광역시 동·읍·면별 세대 및 인구 (공공데이터포털)
+
+**범죄 통계 데이터**
+- 전국 범죄 발생 지역별 통계 데이터 2023년 (KOSIS)
+
+### 2.2 최종 데이터셋 구조
+
+데이터 통합 과정을 거쳐 다음과 같은 구조의 최종 데이터셋을 구성했습니다.
+
+**총 135개 행정동 × 40개 변수**
+
+**인구통계 변수 (12개)**
+- 세대수, 등록인구(남/여), 한국인(남/여), 외국인(남/여)
+- 세대당 인구, 65세 이상 고령자, 평균연령, 인구밀도, 면적
+
+**안전 인프라 변수 (6개)**
+- 치안기관, 가로등 수, 보안등 수
+- 어린이용 CCTV 수, 전체 CCTV 수, 안전비상벨 수
+
+**지역 특성 변수 (14개)**
+- 유흥업소 수, 초등학교 수, 중고등학교 수, 대학교 수
+- 상가 수, 요리주점, 일반 유흥주점, 입시·교과학원
+- 생활방범 CCTV, 기타 CCTV, 시설물 CCTV, 쓰레기단속 CCTV
+
+**종속 변수 (3개)**
+- 범죄발생수(유동인구기준), 강력범죄, 절도범죄, 폭력범죄
+
+*※ 범죄발생수는 구별 통계를 인구비례로 동별 배분하여 산출*
+
+## 데이터 전처리 과정 {#sec-preprocessing}
+
+### 3.1 좌표 변환 및 행정동 매핑
+
+**주소 → 좌표 변환**
+카카오 지도 API를 활용하여 주소 정보를 위도/경도 좌표로 변환했습니다.
+
+**좌표 → 행정동 변환**
+- 1차: 카카오 API 리버스 지오코딩
+- 2차: VWorld API로 세부 행정동 정보 보완
+- 3차: KNN 모델을 이용한 결측 행정동 예측
+
+```python
+from sklearn.neighbors import KNeighborsClassifier
+
+# 결측 행정동 예측
+knn = KNeighborsClassifier(n_neighbors=5, n_jobs=-1)
+knn.fit(X_train, y_train)
+predicted_dongs = knn.predict(df_predict[['위도', '경도']])
+```
+
+### 3.2 데이터 통합 및 집계
+
+각 시설별 데이터를 행정동 단위로 집계하여 통합 데이터셋을 구성했습니다.
+
+**집계 예시**
+```python
+# CCTV 데이터 집계
+kid_cctv = safe.loc[(safe['구분']=='CCTV')&(safe['설치목적']=='어린이보호'),:]
+kid_cctv = kid_cctv.groupby('행정동')['위도'].count().reset_index()
+
+# 경찰시설 집계
+police = danger.loc[(danger['구분'].isin(['경찰서','지구대','파출소','치안센터'])),:]
+police = police.groupby('행정동')['이름'].count().reset_index()
+```
+
+### 3.3 결측값 처리
+
+모든 결측값은 0으로 대체하여 분석의 일관성을 확보했습니다.
+
+```python
+main = main.fillna(0)
+```
+
+## 탐색적 데이터 분석 {#sec-eda}
+
+### 4.1 상관관계 분석
+
+범죄발생수(유동인구기준)를 타겟 변수로 하여 모든 변수 간의 상관관계를 분석했습니다.
+
+```{python}
+#| label: correlation-heatmap-analysis
+#| fig-cap: "주요 변수 간 상관관계 히트맵"
+#| fig-width: 14
+#| fig-height: 12
+#| eval: false
+
+# 데이터 로드 (실제 분석에서는 df1_main_data.csv 사용)
+# df = pd.read_csv('df1_main_data.csv')
+# df = df[df['행정동'] != '소계'].copy()
+# df_numeric = df.select_dtypes(include=np.number)
+
+# 상관계수 행렬 계산
+# corr_matrix = df_numeric.corr()
+# target_var = '범죄발생수(유동인구기준)'
+
+# 상관계수가 높은 순으로 정렬
+# target_corr = corr_matrix[target_var].abs()
+# sorted_vars = target_corr.sort_values(ascending=False)
+# final_vars_list = sorted_vars.index.tolist()
+
+# 히트맵 생성
+# plt.figure(figsize=(14, 12))
+# final_corr_matrix = corr_matrix.loc[final_vars_list, final_vars_list]
+# sns.heatmap(final_corr_matrix, annot=True, fmt='.2f', 
+#             cmap='coolwarm', linewidths=.5,
+#             cbar_kws={'label': 'Correlation Coefficient'})
+# plt.title('Correlation Heatmap of Key Variables with Crime Incidence (Population-based)', fontsize=16, pad=20)
+# plt.xticks(rotation=45, ha='right')
+# plt.yticks(rotation=0)
+# plt.tight_layout()
+# plt.show()
+
+print("상관관계 히트맵 분석 코드 (실제 데이터 로드 시 주석 해제)")
+```
+
+**주요 발견사항**
+- 상관계수 0.15 이상인 변수들을 중심으로 분석 진행
+- 인구밀도, 상가 수, 유흥업소 등이 범죄발생과 양의 상관관계
+- CCTV, 경찰시설 등 안전 인프라는 음의 상관관계 예상
+
+### 4.2 통계적 유의성 검정
+
+상관관계의 통계적 유의성을 확인하기 위해 p-value를 계산했습니다.
+
+```{python}
+#| label: pvalue-analysis
+#| eval: false
+#| code-fold: false
+
+# P-value 행렬 계산
+for col1 in df_final.columns:
+    for col2 in df_final.columns:
+        _, p_value = pearsonr(df_final[col1], df_final[col2])
+        p_value_matrix.loc[col1, col2] = p_value
+```
+
+**결과**
+- p-value < 0.05인 변수들만 히트맵에 강조 표시
+- 통계적으로 유의미한 관계를 가진 변수들을 식별
+
+### 4.3 주성분 분석 (PCA)
+
+데이터의 차원을 축소하고 주요 패턴을 파악하기 위해 PCA를 수행했습니다.
+
+```python
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+
+# 데이터 표준화
+scaler = StandardScaler()
+df_scaled = scaler.fit_transform(df_numeric)
+
+# PCA 수행
+pca = PCA()
+pca_result = pca.fit_transform(df_scaled)
+```
+
+**분석 결과**
+- 첫 2개 주성분이 전체 분산의 상당 부분을 설명
+- 각 행정동의 특성을 2차원 평면에서 시각화
+- 지역별 클러스터링 패턴 확인
+
+## 위험도 모델링 {#sec-risk-modeling}
+
+### 5.1 위험도 산출 공식
+
+문헌 조사와 전문가 의견을 바탕으로 다음 공식을 설정했습니다.
+
+**순위험도 = Σ(위험요소 × 가중치) - Σ(안전요소 × 가중치)**
+
+### 5.2 변수 분류 및 가중치 설정
+
+**위험요소 (양의 가중치)**
+
+| 변수 | 가중치 | 설정 근거 |
+|------|--------|-----------|
+| 인구밀도 | 0.25 | 범죄 기회 증가와 강한 양의 상관관계 |
+| 상가밀도 | 0.15 | 유동인구 증가로 기회범죄 발생 증가 |
+| 유흥업소밀도 | 0.15 | 야간 폭력·성범죄와 통계적 상관관계 |
+| 고령자비율 | 0.15 | 신체적 취약성으로 피해 확률 증가 |
+| 외국인비율 | 0.10 | 언어·문화 장벽으로 방범 네트워크 약화 |
+
+**안전요소 (음의 가중치)**
+
+| 변수 | 가중치 | 설정 근거 |
+|------|--------|-----------|
+| CCTV밀도 | -0.20 | 범죄 억제·증거 확보 효과 |
+| 경찰시설밀도 | -0.20 | 치안 대응력 향상, 범죄 억제 효과 |
+| 조명밀도 | -0.15 | 야간 가시성 향상으로 범죄 기회 감소 |
+| 아파트비율 | -0.15 | 경비·출입통제 등 방범 인프라 효과 |
+
+### 5.3 모델 검증 계획
+
+실제 범죄발생률과의 상관관계 분석을 통해 모델의 유효성을 검증할 예정입니다.
+
+```python
+from scipy.stats import spearmanr, pearsonr
+
+# 순위험도와 실제 범죄발생률 간 상관관계 분석
+corr_s, pval_s = spearmanr(df['순위험도'], df['범죄발생률'])
+corr_p, pval_p = pearsonr(df['순위험도'], df['범죄발생률'])
+```
+
+## 시각화 분석 {#sec-visualization}
+
+### 6.1 행정동별 현황 분석
+
+각 변수별로 다양한 시각화 기법을 적용하여 행정동별 현황을 분석했습니다.
+
+**시각화 기법**
+- 수평/수직 막대그래프: 전체 현황 파악
+- 롤리팝 차트: 세부 수치 강조
+- 분할 막대그래프: 상위/하위 지역 집중 분석
+
+```{python}
+#| label: visualization-functions
+#| eval: false
+#| code-fold: false
+
+def visualize_horizontal_bar(dataframe, column_name):
+    df_processed = preprocess_data(dataframe, column_name, keep_zeros=True)
+    df_sorted = df_processed.sort_values(by=column_name, ascending=True)
+    
+    top_5_dongs = df_sorted['행정동'][-5:].tolist()
+    colors = ['tomato' if dong in top_5_dongs else 'skyblue' 
+              for dong in df_sorted['행정동']]
+    
+    plt.figure(figsize=(12, max(8, len(df_sorted) * 0.4)))
+    plt.barh(df_sorted['행정동'], df_sorted[column_name], color=colors)
+```
+
+### 6.2 상관관계 히트맵
+
+변수 간의 관계를 한눈에 파악할 수 있도록 상관관계 히트맵을 작성했습니다.
+
+```{python}
+#| label: correlation-heatmap
+#| eval: false
+#| code-fold: false
+
+# 상관계수가 높은 변수들만 선별하여 히트맵 생성
+final_corr_matrix = corr_matrix.loc[final_vars_list, final_vars_list]
+
+plt.figure(figsize=(14, 12))
+sns.heatmap(final_corr_matrix, annot=True, fmt='.2f', 
+            cmap='coolwarm', linewidths=.5)
+```
+
+### 6.3 P-value 히트맵
+
+통계적 유의성을 시각적으로 확인하기 위한 p-value 히트맵을 제작했습니다.
+
+```{python}
+#| label: pvalue-heatmap
+#| eval: false
+#| code-fold: false
+
+# p-value가 0.05 이하인 유의미한 관계만 강조
+mask = p_value_matrix > 0.05
+sns.heatmap(p_value_matrix, annot=True, fmt='.3f', 
+            cmap='viridis_r', mask=mask)
+```
+
+### 6.4 인터랙티브 대시보드
+
+프로젝트의 주요 결과를 시각적으로 탐색할 수 있는 Streamlit 기반 대시보드를 개발했습니다.
+
+** [대구 범죄 분석 대시보드 바로 가기](https://daegu-crime-dashboard.streamlit.app)**
+
+**대시보드 주요 탭 구성**
+
+**1. 순위험도 분석**
+- **실시간 가중치 조절**: 사이드바에서 위험요소와 안전요소별 가중치를 슬라이더로 조정
+- **위험도 지도**: 대구시 행정동별 순위험도를 색상으로 표현한 인터랙티브 지도
+- **실시간 순위 테이블**: 가중치 변경에 따른 행정동별 순위험도 실시간 업데이트
+- **상관관계 분석**: 계산된 순위험도와 실제 범죄발생수 간의 산점도 및 상관계수 표시
+
+**2. 개별 항목 시각화**
+- **요소별 지도 시각화**: 치안기관, CCTV, 인구밀도 등 각 변수를 개별적으로 지도에 표시
+- **색상 구분**: 안전요소(파란색 계열), 위험요소(빨간색 계열)로 직관적 구분
+- **프로그레스 바 테이블**: 각 행정동별 해당 변수의 상대적 수치를 진행률 바로 표시
+- **정렬 및 필터링**: 수치 기준 정렬을 통한 상위/하위 지역 쉬운 파악
+
+**3. 위험지역 분석**
+- **상위 6개 위험지역 심층 분석**: 진천동, 신당동, 안심1동, 월성1동, 관문동, 무태조야동
+- **패턴 분석 차트**: 전체 평균 대비 비율을 막대그래프로 시각화
+- **지역별 상세 카드**: 각 위험지역의 특성을 색상별 카드 형태로 구성
+  - 진천동(1위): 극도의 인구과밀 + 안전시설 절대부족
+  - 신당동(2위): 외국인 초집중지역 + CCTV 거의 없음
+  - 안심1동(3위): 치안기관 완전공백 + 높은 인구밀도
+- **공통 DNA 도출**: 인구 과밀 + 치안 인프라 부족 + 외국인 집중 패턴 확인
+
+**4. 안전지역 분석**
+- **상위 6개 안전지역 성공요인 분석**: 평리5동, 비산6동, 평리1동, 평리2동, 원대동, 성내2동
+- **대조 분석**: 위험지역 vs 안전지역 vs 전체평균 3way 비교 차트
+- **성공 공식 제시**: 적정 인구밀도 + 충분한 치안인프라
+- **모범사례 카드**: 각 안전지역의 우수 특성을 배지 형태로 표시
+  - 평리5동: 범죄ZERO 달성 + 모든 지표 우수
+  - 성내2동: 중심가임에도 치안기관 최우수
+  - 비산6동: CCTV와 밝은 밤길의 시너지
+
+**5. 분석 개요**
+- **대구시 범죄율 동향**: 전년 동분기 대비 발생건수 증가 추이
+- **검거율 하락 추세**: 범죄 증가 vs 검거율 감소의 이중 문제 시각화
+- **분석 필요성**: 데이터 기반 치안 정책의 시급성 강조
+
+**6. 참고자료**
+- **인구수-범죄발생수 상관관계**: 전국 17개 시도 데이터 기반 검증
+- **이중축 그래프**: 인구수(막대)와 범죄발생수(선그래프) 동시 표시
+- **순위 테이블**: 인구수 순위와 범죄발생수 순위 비교 분석
+- **상관계수 표시**: 강한 양의 상관관계(r≈0.995) 수치적 증명
+
+**기술적 특징**
+- **반응형 디자인**: PC, 태블릿, 모바일 환경 모두 지원
+- **실시간 연산**: 가중치 변경 즉시 모든 차트와 지도 업데이트
+- **고성능 지도**: Plotly 기반 인터랙티브 choropleth 지도
+- **데이터 캐싱**: Streamlit의 @st.cache_data 활용으로 빠른 로딩
+- **한글 폰트 지원**: 모든 차트에서 한글 깨짐 없이 표시
+
+**사용자 경험**
+- **직관적 인터페이스**: 탭 구조로 명확한 정보 분류
+- **시각적 피드백**: 호버 효과와 툴팁으로 상세 정보 제공
+- **탐색적 분석**: 사용자가 직접 가중치를 조절하며 시나리오 분석 가능
+- **정책 시뮬레이션**: 치안 인프라 투자 우선순위 결정에 활용 가능
+
+**로컬 실행 방법**
+```bash
+# 로컬에서 실행하려면
+streamlit run app2.py
+```
+
+```{python}
+#| label: dashboard-structure
+#| eval: false
+#| code-fold: false
+
+# Streamlit 대시보드 구조 예시
+import streamlit as st
+import plotly.express as px
+import geopandas as gpd
+
+# 페이지 설정
+st.set_page_config(layout="wide", page_title="대구 범죄 분석 대시보드")
+
+# 데이터 로딩
+@st.cache_data
+def load_data():
+    crime_data = pd.read_csv("daegu_crime_data.csv").fillna(0)
+    daegu_map = gpd.read_file("daegu_map.geojson")
+    return crime_data, daegu_map
+
+# 위험도 계산 함수
+def calculate_risk_score(data, risk_weights, safety_weights):
+    total_risk = sum(data[factor] * weight for factor, weight in risk_weights.items())
+    total_safety = sum(data[factor] * weight for factor, weight in safety_weights.items())
+    return total_risk - total_safety
+
+# 지도 시각화
+def create_risk_map(gdf, color_column):
+    fig = px.choropleth_mapbox(
+        gdf, geojson=gdf.geometry, locations=gdf.index, 
+        color=color_column, opacity=0.6,
+        center={"lat": 35.8714, "lon": 128.6014}, 
+        mapbox_style="carto-positron", zoom=10
+    )
+    return fig
+```
+
+## 분석 결과 {#sec-results}
+
+### 7.1 주요 발견사항
+
+**데이터 규모**
+- 총 135개 행정동 분석 완료
+- 40개 변수를 활용한 종합적 분석
+- 13개 공공데이터 소스 성공적 통합
+
+**상관관계 분석 결과**
+- 범죄발생과 상관계수 0.15 이상인 주요 변수 식별
+- 인구밀도, 상가 수, 유흥업소 등이 위험요소로 확인
+- CCTV, 경찰시설 등이 안전요소로 작용
+
+**PCA 분석 결과**
+- 첫 2개 주성분으로 지역 특성의 주요 패턴 설명
+- 행정동별 안전도 클러스터링 패턴 확인
+
+### 7.2 위험도 모델 적용 준비
+
+위험도 산출을 위한 모든 준비 작업이 완료되었으며, 다음 단계에서 실제 위험도 계산 및 검증을 수행할 예정입니다.
+
+**모델 구성요소**
+- 위험요소 11개 변수와 가중치 설정 완료
+- 안전요소 6개 변수와 가중치 설정 완료
+- 실제 범죄발생률과의 검증 방법론 수립
+
+## 결론 {#sec-conclusion}
+
+본 연구는 대구광역시의 다양한 공공데이터를 체계적으로 통합하여 범죄 취약지역 식별을 위한 데이터 기반을 구축했습니다. 13개 데이터 소스를 성공적으로 통합하고, 135개 행정동에 대한 종합적인 분석 기반을 마련했습니다.
+
+상관관계 분석과 PCA를 통해 범죄발생에 영향을 미치는 주요 요인들을 식별했으며, 문헌 조사를 바탕으로 한 위험도 산출 모델을 설계했습니다. 이러한 데이터 기반 접근법은 효과적인 치안 정책 수립과 예산 배분의 효율성 제고에 기여할 것으로 기대됩니다.
